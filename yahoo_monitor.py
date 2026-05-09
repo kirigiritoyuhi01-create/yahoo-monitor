@@ -31,7 +31,7 @@ API_INTERVAL   = 1.0
 
 COL = {
     "商品名":       0,
-    "JAN":         1,
+    "jan_code":         1,
     "URL":         6,
     "ショップ名":   7,
     "商品価格":     8,
@@ -94,7 +94,7 @@ def bulk_update_row(sheet, row: int, updates: dict):
 def search_yahoo_best(jan_code: str) -> Optional[dict]:
     params = {
         "appid":    YAHOO_APP_ID,
-        "jan":      jan_code,       # FIX ①: jan_code → jan（正しいパラメータ名）
+        "jan_code":      jan_code,       # FIX ①: jan_code → jan（正しいパラメータ名）
         "results":  FETCH_COUNT,
         "sort":     "+price",
         #"condition": "new",
@@ -114,15 +114,17 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
         best_shipping_cost = 0
 
         for item in hits:
+            if item.get("condition") != "new":
+                continue
             price    = item.get("price", 0) or 0
             shipping = item.get("shipping", {})
 
             # FIX ③: code==2 は非公式判定 → name のみで判定
-            if shipping.get("name") == "送料無料":
+           if shipping.get("code") == 2 or shipping.get("name") == "送料無料":
                 shipping_cost = 0
             else:
                 # FIX ②: lowestPrice → minPrice（正しいフィールド名）
-                shipping_cost = shipping.get("minPrice", 0) or 0
+                shipping_cost = shipping.get("lowestPrice", 0) or 0
 
             total = price + shipping_cost
 
@@ -213,20 +215,9 @@ def now_jst() -> str:
 # メイン処理
 # ───────────────────────────────────────────
 def run():
-    # 確認用：1件だけAPIレスポンスを全部表示
-    result = requests.get(YAHOO_API_URL, params={
-        "appid": YAHOO_APP_ID,
-        "jan_code": "4902370552683",
-    }).json()
-    log.info(json.dumps(result, ensure_ascii=False, indent=2))
-    return  # 1件確認したら止める
     log.info("=== Yahoo Monitor BOT 開始 ===")
     sheet = get_sheet()
-
     all_values = sheet.get_all_values()
-    processed  = 0
-    errors     = 0
-
     for i, row_data in enumerate(all_values):
         sheet_row = i + 1
         if sheet_row == 1:
