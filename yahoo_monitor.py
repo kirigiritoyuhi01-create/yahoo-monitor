@@ -1,11 +1,3 @@
-"""
-Yahoo Shopping Monitor Bot
-- APIで10件取得 → 送料込み最安値を選択
-- クーポンのみPlaywright（確認済みセレクタ使用）
-- 対象列: G〜L, O〜P のみ更新
-- 絶対禁止: A〜F, M〜N
-"""
-
 import os
 import re
 import time
@@ -64,7 +56,6 @@ def get_sheet():
         sa_info,
         scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
-    # FIX ⑤: authorize() は非推奨 → Client() を使用
     gc = gspread.Client(auth=creds)
     return gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
 
@@ -94,11 +85,9 @@ def bulk_update_row(sheet, row: int, updates: dict):
 def search_yahoo_best(jan_code: str) -> Optional[dict]:
     params = {
         "appid":    YAHOO_APP_ID,
-        "jan_code":      jan_code,       # FIX ①: jan_code → jan（正しいパラメータ名）
+        "jan_code": jan_code,   # 正しいパラメータ名（あなたのFIXを採用）
         "results":  FETCH_COUNT,
         "sort":     "+price",
-        #"condition": "new",
-        #"in_stock": "true",
     }
     try:
         resp = requests.get(YAHOO_API_URL, params=params, timeout=15)
@@ -116,27 +105,27 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
         for item in hits:
             if item.get("condition") != "new":
                 continue
+
             price    = item.get("price", 0) or 0
             shipping = item.get("shipping", {})
 
-            # FIX ③: code==2 は非公式判定 → name のみで判定
+            # 送料無料判定（あなたのFIX）
             if shipping.get("code") == 2 or shipping.get("name") == "送料無料":
                 shipping_cost = 0
             else:
-                # FIX ②: lowestPrice → minPrice（正しいフィールド名）
                 shipping_cost = shipping.get("lowestPrice", 0) or 0
 
             total = price + shipping_cost
 
             if total < best_total:
-                best_total         = total
-                best_item          = item
+                best_total = total
+                best_item = item
                 best_shipping_cost = shipping_cost
 
         if best_item is None:
             return None
 
-        # FIX ⑦: bonusAmount も考慮
+        # ポイント（あなたのFIX）
         point_data = best_item.get("point", {})
         point = (
             point_data.get("lyLimitedBonusAmount") or
@@ -165,7 +154,6 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
 # Playwright クーポン取得
 # ───────────────────────────────────────────
 def get_coupon(jan_code: str) -> int:
-    # FIX ⑥: JANコードをURLエンコード
     from urllib.parse import quote
     url = (
         f"https://shopping.yahoo.co.jp/search/{quote(jan_code)}/0/"
@@ -179,15 +167,13 @@ def get_coupon(jan_code: str) -> int:
                 page = browser.new_page()
                 page.goto(url, timeout=30000, wait_until="domcontentloaded")
 
-                # FIX ④: 固定待機 → セレクタ出現まで待機（最大5秒）
                 selector = '[class*="SearchResultItem__coupon--withLabel"]'
                 try:
                     page.wait_for_selector(selector, timeout=5000)
                 except Exception:
-                    pass  # 要素なし＝クーポンなし
+                    pass
 
                 elem = page.query_selector(selector)
-
                 if not elem:
                     return 0
 
@@ -196,7 +182,6 @@ def get_coupon(jan_code: str) -> int:
                 return int(nums[0]) if nums else 0
 
             finally:
-                # FIX ⑧: 例外時も必ずブラウザを閉じる
                 browser.close()
 
     except Exception as e:
@@ -218,12 +203,16 @@ def run():
     log.info("=== Yahoo Monitor BOT 開始 ===")
     sheet = get_sheet()
     all_values = sheet.get_all_values()
+
+    processed = 0
+    errors = 0
+
     for i, row_data in enumerate(all_values):
         sheet_row = i + 1
         if sheet_row == 1:
             continue
 
-        jan_code     = row_data[COL["JAN"]].strip()    if len(row_data) > COL["JAN"]    else ""
+        jan_code = row_data[COL["JAN"]].strip() if len(row_data) > COL["JAN"] else ""
         product_name = row_data[COL["商品名"]].strip() if len(row_data) > COL["商品名"] else ""
 
         if not jan_code and not product_name:
@@ -235,43 +224,45 @@ def run():
 
         log.info(f"[行{sheet_row}] JAN={jan_code}")
 
-        result    = search_yahoo_best(jan_code)
+        result = search_yahoo_best(jan_code)
         timestamp = now_jst()
 
         if result is None:
             updates = {
-                COL["URL"]:         "",
-                COL["ショップ名"]:   "",
-                COL["商品価格"]:     "",
-                COL["送料"]:         "",
-                COL["ポイント"]:     "",
-                COL["クーポン"]:     "",
+                COL["URL"]: "",
+                COL["ショップ名"]: "",
+                COL["商品価格"]: "",
+                COL["送料"]: "",
+                COL["ポイント"]: "",
+                COL["クーポン"]: "",
                 COL["最終取得時間"]: timestamp,
-                COL["取得状態"]:     "商品なし",
+                COL["取得状態"]: "商品なし",
             }
+
         elif "error" in result:
             updates = {
                 COL["最終取得時間"]: timestamp,
-                COL["取得状態"]:     result["error"],
+                COL["取得状態"]: result["error"],
             }
             errors += 1
+
         else:
             coupon_val = get_coupon(jan_code)
             if coupon_val == -1:
-                status     = "クーポン取得失敗"
+                status = "クーポン取得失敗"
                 coupon_val = 0
             else:
                 status = "成功"
 
             updates = {
-                COL["URL"]:         result["url"],
-                COL["ショップ名"]:   result["shop_name"],
-                COL["商品価格"]:     result["price"],
-                COL["送料"]:         result["shipping"],
-                COL["ポイント"]:     result["point"],
-                COL["クーポン"]:     coupon_val,
+                COL["URL"]: result["url"],
+                COL["ショップ名"]: result["shop_name"],
+                COL["商品価格"]: result["price"],
+                COL["送料"]: result["shipping"],
+                COL["ポイント"]: result["point"],
+                COL["クーポン"]: coupon_val,
                 COL["最終取得時間"]: timestamp,
-                COL["取得状態"]:     status,
+                COL["取得状態"]: status,
             }
             processed += 1
 
