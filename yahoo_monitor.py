@@ -97,8 +97,8 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
         "jan":      jan_code,       # FIX ①: jan_code → jan（正しいパラメータ名）
         "results":  FETCH_COUNT,
         "sort":     "+price",
-        ＃"condition": "new",
-        ＃"in_stock": "true",
+        #"condition": "new",
+        #"in_stock": "true",
     }
     try:
         resp = requests.get(YAHOO_API_URL, params=params, timeout=15)
