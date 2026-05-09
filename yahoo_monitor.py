@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 import gspread
 from google.oauth2.service_account import Credentials
+from playwright.sync_api import sync_playwright
 
 # ───────────────────────────────────────────
 # 設定
@@ -21,7 +22,7 @@ GCP_SA_JSON    = os.environ["GCP_SERVICE_ACCOUNT_JSON"]
 
 YAHOO_API_URL  = "https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch"
 FETCH_COUNT    = 10
-API_INTERVAL   = 0.3   # 1.0 → 0.3 に短縮（必要なら 0.5 でも可）
+API_INTERVAL   = 0.2
 
 COL = {
     "商品名":       0,
@@ -58,14 +59,14 @@ def get_sheet():
         sa_info,
         scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
-    gc = gspread.Client(auth=creds)
+    gc = gspread.authorize(creds)
     return gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
 
 
 # ───────────────────────────────────────────
-# 列破壊防止
+# 列破壊防止 + 複数行まとめ更新
 # ───────────────────────────────────────────
-def bulk_update_row(sheet, row: int, updates: dict):
+def append_row_updates(cell_buffer: list, row: int, updates: dict):
     for col_idx in updates:
         if col_idx in FORBIDDEN_COLS:
             raise RuntimeError(
@@ -74,17 +75,16 @@ def bulk_update_row(sheet, row: int, updates: dict):
         if col_idx not in WRITABLE_COLS:
             raise RuntimeError(f"予期しない列: 列{col_idx+1}")
 
-    cell_list = [
-        gspread.Cell(row=row, col=col_idx + 1, value=value)
-        for col_idx, value in updates.items()
-    ]
-    sheet.update_cells(cell_list, value_input_option="USER_ENTERED")
+    for col_idx, value in updates.items():
+        cell_buffer.append(
+            gspread.Cell(row=row, col=col_idx + 1, value=value)
+        )
 
 
 # ───────────────────────────────────────────
 # Yahoo Shopping API
 # ───────────────────────────────────────────
-def search_yahoo_best(jan_code: str) -> Optional[dict]:
+def search_yahoo_best(session: requests.Session, jan_code: str) -> Optional[dict]:
     params = {
         "appid":    YAHOO_APP_ID,
         "jan_code": jan_code,
@@ -92,7 +92,7 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
         "sort":     "+price",
     }
     try:
-        resp = requests.get(YAHOO_API_URL, params=params, timeout=15)
+        resp = session.get(YAHOO_API_URL, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
 
@@ -100,8 +100,8 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
         if not hits:
             return None
 
-        best_item          = None
-        best_total         = float("inf")
+        best_item = None
+        best_total = float("inf")
         best_shipping_cost = 0
 
         for item in hits:
@@ -151,25 +151,20 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
 
 
 # ───────────────────────────────────────────
-# クーポン文字列解析
+# クーポン取得
 # ───────────────────────────────────────────
-def parse_coupon_value(coupon_text: str) -> int:
-    if not coupon_text:
+def parse_coupon_value(text: str) -> int:
+    if not text:
         return 0
-
-    nums = re.findall(r"\d+", coupon_text.replace(",", ""))
+    nums = re.findall(r"\d+", text.replace(",", ""))
     return int(nums[0]) if nums else 0
 
 
-# ───────────────────────────────────────────
-# Playwright クーポン取得（page使い回し）
-# ───────────────────────────────────────────
 def get_coupon_from_page(page, jan_code: str) -> int:
     url = (
         f"https://shopping.yahoo.co.jp/search/{quote(jan_code)}/0/"
         f"?tab_ex=commerce&used=2&prom=1&X=12"
     )
-
     selector = '[class*="SearchResultItem__coupon--withLabel"]'
 
     try:
@@ -209,28 +204,27 @@ def run():
 
     processed = 0
     errors = 0
+    cell_buffer = []
 
-    # 同一JANの無駄呼び出し防止
     item_cache = {}
     coupon_cache = {}
 
-    from playwright.sync_api import sync_playwright
+    session = requests.Session()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
             args=[
-                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
         context = browser.new_context()
 
-        # 不要リソースをブロックして軽量化
         def route_handler(route):
             req = route.request
-            if req.resource_type in {"image", "media", "font"}:
+            if req.resource_type in {"image", "font", "media"}:
                 route.abort()
             else:
                 route.continue_()
@@ -259,7 +253,7 @@ def run():
                 if jan_code in item_cache:
                     result = item_cache[jan_code]
                 else:
-                    result = search_yahoo_best(jan_code)
+                    result = search_yahoo_best(session, jan_code)
                     item_cache[jan_code] = result
 
                 timestamp = now_jst()
@@ -309,20 +303,22 @@ def run():
                     processed += 1
 
                 try:
-                    bulk_update_row(sheet, sheet_row, updates)
+                    append_row_updates(cell_buffer, sheet_row, updates)
                 except RuntimeError as e:
                     log.error(str(e))
-                    continue
-                except Exception as e:
-                    log.error(f"[行{sheet_row}] シート更新失敗: {e}")
                     errors += 1
                     continue
 
                 time.sleep(API_INTERVAL)
 
+            # 最後にまとめて一括更新
+            if cell_buffer:
+                sheet.update_cells(cell_buffer, value_input_option="USER_ENTERED")
+
         finally:
             context.close()
             browser.close()
+            session.close()
 
     log.info(f"=== 完了: 成功={processed}, エラー={errors} ===")
 
