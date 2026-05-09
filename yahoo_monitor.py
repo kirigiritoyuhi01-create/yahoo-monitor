@@ -6,6 +6,8 @@ import logging
 import requests
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from urllib.parse import quote
+
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -19,7 +21,7 @@ GCP_SA_JSON    = os.environ["GCP_SERVICE_ACCOUNT_JSON"]
 
 YAHOO_API_URL  = "https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch"
 FETCH_COUNT    = 10
-API_INTERVAL   = 1.0
+API_INTERVAL   = 0.3   # 1.0 → 0.3 に短縮（必要なら 0.5 でも可）
 
 COL = {
     "商品名":       0,
@@ -85,7 +87,7 @@ def bulk_update_row(sheet, row: int, updates: dict):
 def search_yahoo_best(jan_code: str) -> Optional[dict]:
     params = {
         "appid":    YAHOO_APP_ID,
-        "jan_code": jan_code,   # 正しいパラメータ名（あなたのFIXを採用）
+        "jan_code": jan_code,
         "results":  FETCH_COUNT,
         "sort":     "+price",
     }
@@ -106,14 +108,13 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
             if item.get("condition") != "new":
                 continue
 
-            price    = item.get("price", 0) or 0
-            shipping = item.get("shipping", {})
+            price = int(item.get("price", 0) or 0)
+            shipping = item.get("shipping", {}) or {}
 
-            # 送料無料判定（あなたのFIX）
             if shipping.get("code") == 2 or shipping.get("name") == "送料無料":
                 shipping_cost = 0
             else:
-                shipping_cost = shipping.get("lowestPrice", 0) or 0
+                shipping_cost = int(shipping.get("lowestPrice", 0) or 0)
 
             total = price + shipping_cost
 
@@ -125,8 +126,7 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
         if best_item is None:
             return None
 
-        # ポイント（あなたのFIX）
-        point_data = best_item.get("point", {})
+        point_data = best_item.get("point", {}) or {}
         point = (
             point_data.get("lyLimitedBonusAmount") or
             point_data.get("bonusAmount") or
@@ -136,56 +136,59 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
 
         return {
             "url":       best_item.get("url", ""),
-            "shop_name": best_item.get("seller", {}).get("name", ""),
-            "price":     best_item.get("price", 0),
+            "shop_name": (best_item.get("seller") or {}).get("name", ""),
+            "price":     int(best_item.get("price", 0) or 0),
             "shipping":  best_shipping_cost,
-            "point":     point,
+            "point":     int(point or 0),
         }
 
     except requests.exceptions.Timeout:
         log.warning(f"Yahoo API タイムアウト: {jan_code}")
         return {"error": "API失敗"}
     except Exception as e:
-        log.error(f"Yahoo API エラー: {e}")
+        log.error(f"Yahoo API エラー ({jan_code}): {e}")
         return {"error": "API失敗"}
 
 
 # ───────────────────────────────────────────
-# Playwright クーポン取得
+# クーポン文字列解析
 # ───────────────────────────────────────────
-def get_coupon(jan_code: str) -> int:
-    from urllib.parse import quote
+def parse_coupon_value(coupon_text: str) -> int:
+    if not coupon_text:
+        return 0
+
+    nums = re.findall(r"\d+", coupon_text.replace(",", ""))
+    return int(nums[0]) if nums else 0
+
+
+# ───────────────────────────────────────────
+# Playwright クーポン取得（page使い回し）
+# ───────────────────────────────────────────
+def get_coupon_from_page(page, jan_code: str) -> int:
     url = (
         f"https://shopping.yahoo.co.jp/search/{quote(jan_code)}/0/"
         f"?tab_ex=commerce&used=2&prom=1&X=12"
     )
+
+    selector = '[class*="SearchResultItem__coupon--withLabel"]'
+
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            try:
-                page = browser.new_page()
-                page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        page.goto(url, timeout=10000, wait_until="domcontentloaded")
 
-                selector = '[class*="SearchResultItem__coupon--withLabel"]'
-                try:
-                    page.wait_for_selector(selector, timeout=5000)
-                except Exception:
-                    pass
+        try:
+            page.wait_for_selector(selector, timeout=2000)
+        except Exception:
+            return 0
 
-                elem = page.query_selector(selector)
-                if not elem:
-                    return 0
+        elem = page.query_selector(selector)
+        if not elem:
+            return 0
 
-                coupon_text = elem.inner_text()
-                nums = re.findall(r"\d+", coupon_text.replace(",", ""))
-                return int(nums[0]) if nums else 0
-
-            finally:
-                browser.close()
+        coupon_text = elem.inner_text()
+        return parse_coupon_value(coupon_text)
 
     except Exception as e:
-        log.warning(f"Playwright クーポン取得失敗 ({jan_code}): {e}")
+        log.warning(f"Playwright クーポン取得失敗 ({jan_code}): {type(e).__name__}: {e}")
         return -1
 
 
@@ -207,72 +210,119 @@ def run():
     processed = 0
     errors = 0
 
-    for i, row_data in enumerate(all_values):
-        sheet_row = i + 1
-        if sheet_row == 1:
-            continue
+    # 同一JANの無駄呼び出し防止
+    item_cache = {}
+    coupon_cache = {}
 
-        jan_code = row_data[COL["JAN"]].strip() if len(row_data) > COL["JAN"] else ""
-        product_name = row_data[COL["商品名"]].strip() if len(row_data) > COL["商品名"] else ""
+    from playwright.sync_api import sync_playwright
 
-        if not jan_code and not product_name:
-            continue
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        context = browser.new_context()
 
-        if not jan_code:
-            log.warning(f"[行{sheet_row}] JANコードなし・スキップ: {product_name}")
-            continue
-
-        log.info(f"[行{sheet_row}] JAN={jan_code}")
-
-        result = search_yahoo_best(jan_code)
-        timestamp = now_jst()
-
-        if result is None:
-            updates = {
-                COL["URL"]: "",
-                COL["ショップ名"]: "",
-                COL["商品価格"]: "",
-                COL["送料"]: "",
-                COL["ポイント"]: "",
-                COL["クーポン"]: "",
-                COL["最終取得時間"]: timestamp,
-                COL["取得状態"]: "商品なし",
-            }
-
-        elif "error" in result:
-            updates = {
-                COL["最終取得時間"]: timestamp,
-                COL["取得状態"]: result["error"],
-            }
-            errors += 1
-
-        else:
-            coupon_val = get_coupon(jan_code)
-            if coupon_val == -1:
-                status = "クーポン取得失敗"
-                coupon_val = 0
+        # 不要リソースをブロックして軽量化
+        def route_handler(route):
+            req = route.request
+            if req.resource_type in {"image", "media", "font"}:
+                route.abort()
             else:
-                status = "成功"
+                route.continue_()
 
-            updates = {
-                COL["URL"]: result["url"],
-                COL["ショップ名"]: result["shop_name"],
-                COL["商品価格"]: result["price"],
-                COL["送料"]: result["shipping"],
-                COL["ポイント"]: result["point"],
-                COL["クーポン"]: coupon_val,
-                COL["最終取得時間"]: timestamp,
-                COL["取得状態"]: status,
-            }
-            processed += 1
+        context.route("**/*", route_handler)
+        page = context.new_page()
 
         try:
-            bulk_update_row(sheet, sheet_row, updates)
-        except RuntimeError as e:
-            log.error(str(e))
-            continue
+            for i, row_data in enumerate(all_values):
+                sheet_row = i + 1
+                if sheet_row == 1:
+                    continue
 
-        time.sleep(API_INTERVAL)
+                jan_code = row_data[COL["JAN"]].strip() if len(row_data) > COL["JAN"] else ""
+                product_name = row_data[COL["商品名"]].strip() if len(row_data) > COL["商品名"] else ""
+
+                if not jan_code and not product_name:
+                    continue
+
+                if not jan_code:
+                    log.warning(f"[行{sheet_row}] JANコードなし・スキップ: {product_name}")
+                    continue
+
+                log.info(f"[行{sheet_row}] JAN={jan_code}")
+
+                if jan_code in item_cache:
+                    result = item_cache[jan_code]
+                else:
+                    result = search_yahoo_best(jan_code)
+                    item_cache[jan_code] = result
+
+                timestamp = now_jst()
+
+                if result is None:
+                    updates = {
+                        COL["URL"]: "",
+                        COL["ショップ名"]: "",
+                        COL["商品価格"]: "",
+                        COL["送料"]: "",
+                        COL["ポイント"]: "",
+                        COL["クーポン"]: "",
+                        COL["最終取得時間"]: timestamp,
+                        COL["取得状態"]: "商品なし",
+                    }
+
+                elif "error" in result:
+                    updates = {
+                        COL["最終取得時間"]: timestamp,
+                        COL["取得状態"]: result["error"],
+                    }
+                    errors += 1
+
+                else:
+                    if jan_code in coupon_cache:
+                        coupon_val = coupon_cache[jan_code]
+                    else:
+                        coupon_val = get_coupon_from_page(page, jan_code)
+                        coupon_cache[jan_code] = coupon_val
+
+                    if coupon_val == -1:
+                        status = "クーポン取得失敗"
+                        coupon_val = 0
+                    else:
+                        status = "成功"
+
+                    updates = {
+                        COL["URL"]: result["url"],
+                        COL["ショップ名"]: result["shop_name"],
+                        COL["商品価格"]: result["price"],
+                        COL["送料"]: result["shipping"],
+                        COL["ポイント"]: result["point"],
+                        COL["クーポン"]: coupon_val,
+                        COL["最終取得時間"]: timestamp,
+                        COL["取得状態"]: status,
+                    }
+                    processed += 1
+
+                try:
+                    bulk_update_row(sheet, sheet_row, updates)
+                except RuntimeError as e:
+                    log.error(str(e))
+                    continue
+                except Exception as e:
+                    log.error(f"[行{sheet_row}] シート更新失敗: {e}")
+                    errors += 1
+                    continue
+
+                time.sleep(API_INTERVAL)
+
+        finally:
+            context.close()
+            browser.close()
 
     log.info(f"=== 完了: 成功={processed}, エラー={errors} ===")
 
