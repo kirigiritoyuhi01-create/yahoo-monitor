@@ -213,6 +213,14 @@ def now_jst() -> str:
 # メイン処理
 # ───────────────────────────────────────────
 def run():
+    # 確認用：1件だけAPIレスポンスを全部表示
+result = requests.get(YAHOO_API_URL, params={
+    "appid": YAHOO_APP_ID,
+    "jan": "4902370552683",
+    "results": 1,
+}).json()
+log.info(json.dumps(result, ensure_ascii=False, indent=2))
+return  # 1件確認したら止める
     log.info("=== Yahoo Monitor BOT 開始 ===")
     sheet = get_sheet()
 
