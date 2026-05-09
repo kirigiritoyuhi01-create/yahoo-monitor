@@ -26,26 +26,24 @@ SHEET_NAME     = os.environ.get("SHEET_NAME", "Sheet1")
 GCP_SA_JSON    = os.environ["GCP_SERVICE_ACCOUNT_JSON"]
 
 YAHOO_API_URL  = "https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch"
-FETCH_COUNT    = 10   # 送料込み最安値計算のために取得する件数
-API_INTERVAL   = 1.0  # API制限対策（1秒/リクエスト）
+FETCH_COUNT    = 10
+API_INTERVAL   = 1.0
 
-# 列定義（0始まりインデックス）
 COL = {
-    "商品名":       0,   # A 読み取り専用
-    "JAN":         1,   # B 読み取り専用
-    "URL":         6,   # G
-    "ショップ名":   7,   # H
-    "商品価格":     8,   # I
-    "送料":         9,   # J
-    "ポイント":    10,   # K
-    "クーポン":    11,   # L
-    # M=12, N=13 はスプレッドシート関数 → 絶対禁止
-    "最終取得時間": 14,  # O
-    "取得状態":    15,   # P
+    "商品名":       0,
+    "JAN":         1,
+    "URL":         6,
+    "ショップ名":   7,
+    "商品価格":     8,
+    "送料":         9,
+    "ポイント":    10,
+    "クーポン":    11,
+    "最終取得時間": 14,
+    "取得状態":    15,
 }
 
-WRITABLE_COLS  = {6, 7, 8, 9, 10, 11, 14, 15}  # G,H,I,J,K,L,O,P
-FORBIDDEN_COLS = {0, 1, 2, 3, 4, 5, 12, 13}    # A,B,C,D,E,F,M,N
+WRITABLE_COLS  = {6, 7, 8, 9, 10, 11, 14, 15}
+FORBIDDEN_COLS = {0, 1, 2, 3, 4, 5, 12, 13}
 
 JST = timezone(timedelta(hours=9))
 
@@ -66,12 +64,13 @@ def get_sheet():
         sa_info,
         scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
-    gc = gspread.authorize(creds)
+    # FIX ⑤: authorize() は非推奨 → Client() を使用
+    gc = gspread.Client(auth=creds)
     return gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
 
 
 # ───────────────────────────────────────────
-# 列破壊防止（絶対に外さない）
+# 列破壊防止
 # ───────────────────────────────────────────
 def bulk_update_row(sheet, row: int, updates: dict):
     for col_idx in updates:
@@ -90,20 +89,16 @@ def bulk_update_row(sheet, row: int, updates: dict):
 
 
 # ───────────────────────────────────────────
-# Yahoo Shopping API（10件取得→送料込み最安値選択）
+# Yahoo Shopping API
 # ───────────────────────────────────────────
 def search_yahoo_best(jan_code: str) -> Optional[dict]:
-    """
-    JANコードで新品10件取得し、送料込み最安値の1件を返す
-    返り値: {url, shop_name, price, shipping, point} or None or {"error": "..."}
-    """
     params = {
-        "appid":     YAHOO_APP_ID,
-        "jan_code":  jan_code,
-        "results":   FETCH_COUNT,
-        "sort":      "+price",
+        "appid":    YAHOO_APP_ID,
+        "jan":      jan_code,       # FIX ①: jan_code → jan（正しいパラメータ名）
+        "results":  FETCH_COUNT,
+        "sort":     "+price",
         "condition": "new",
-        "in_stock":  "true",
+        "in_stock": "true",
     }
     try:
         resp = requests.get(YAHOO_API_URL, params=params, timeout=15)
@@ -114,19 +109,20 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
         if not hits:
             return None
 
-        # 送料込み金額で最安値を選ぶ
-        best_item         = None
-        best_total        = float("inf")
+        best_item          = None
+        best_total         = float("inf")
         best_shipping_cost = 0
 
         for item in hits:
             price    = item.get("price", 0) or 0
             shipping = item.get("shipping", {})
 
-            if shipping.get("code") == 2 or shipping.get("name") == "送料無料":
+            # FIX ③: code==2 は非公式判定 → name のみで判定
+            if shipping.get("name") == "送料無料":
                 shipping_cost = 0
             else:
-                shipping_cost = shipping.get("lowestPrice", 0) or 0
+                # FIX ②: lowestPrice → minPrice（正しいフィールド名）
+                shipping_cost = shipping.get("minPrice", 0) or 0
 
             total = price + shipping_cost
 
@@ -138,10 +134,11 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
         if best_item is None:
             return None
 
-        # ポイント（LYPポイント優先）
+        # FIX ⑦: bonusAmount も考慮
         point_data = best_item.get("point", {})
         point = (
             point_data.get("lyLimitedBonusAmount") or
+            point_data.get("bonusAmount") or
             point_data.get("amount") or
             0
         )
@@ -163,37 +160,42 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
 
 
 # ───────────────────────────────────────────
-# Playwright クーポン取得（確認済みセレクタ）
+# Playwright クーポン取得
 # ───────────────────────────────────────────
 def get_coupon(jan_code: str) -> int:
-    """
-    一覧ページ（価格+送料が安い順・新品）から
-    1件目のクーポンバッジを取得
-    返り値: クーポン額（円）/ 0=なし / -1=取得失敗
-    """
+    # FIX ⑥: JANコードをURLエンコード
+    from urllib.parse import quote
     url = (
-        f"https://shopping.yahoo.co.jp/search/{jan_code}/0/"
+        f"https://shopping.yahoo.co.jp/search/{quote(jan_code)}/0/"
         f"?tab_ex=commerce&used=2&prom=1&X=12"
     )
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            page.wait_for_timeout(2000)
+            try:
+                page = browser.new_page()
+                page.goto(url, timeout=30000, wait_until="domcontentloaded")
 
-            # 確認済みセレクタ
-            selector = '[class*="SearchResultItem__coupon--withLabel"]'
-            elem = page.query_selector(selector)
-            browser.close()
+                # FIX ④: 固定待機 → セレクタ出現まで待機（最大5秒）
+                selector = '[class*="SearchResultItem__coupon--withLabel"]'
+                try:
+                    page.wait_for_selector(selector, timeout=5000)
+                except Exception:
+                    pass  # 要素なし＝クーポンなし
 
-            if not elem:
-                return 0
+                elem = page.query_selector(selector)
 
-            coupon_text = elem.inner_text()
-            nums = re.findall(r"\d+", coupon_text.replace(",", ""))
-            return int(nums[0]) if nums else 0
+                if not elem:
+                    return 0
+
+                coupon_text = elem.inner_text()
+                nums = re.findall(r"\d+", coupon_text.replace(",", ""))
+                return int(nums[0]) if nums else 0
+
+            finally:
+                # FIX ⑧: 例外時も必ずブラウザを閉じる
+                browser.close()
 
     except Exception as e:
         log.warning(f"Playwright クーポン取得失敗 ({jan_code}): {e}")
@@ -221,13 +223,13 @@ def run():
     for i, row_data in enumerate(all_values):
         sheet_row = i + 1
         if sheet_row == 1:
-            continue  # ヘッダースキップ
+            continue
 
         jan_code     = row_data[COL["JAN"]].strip()    if len(row_data) > COL["JAN"]    else ""
         product_name = row_data[COL["商品名"]].strip() if len(row_data) > COL["商品名"] else ""
 
         if not jan_code and not product_name:
-            continue  # 空行スキップ
+            continue
 
         if not jan_code:
             log.warning(f"[行{sheet_row}] JANコードなし・スキップ: {product_name}")
