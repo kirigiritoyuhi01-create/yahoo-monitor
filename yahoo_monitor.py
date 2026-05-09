@@ -216,8 +216,7 @@ def run():
     # 確認用：1件だけAPIレスポンスを全部表示
     result = requests.get(YAHOO_API_URL, params={
         "appid": YAHOO_APP_ID,
-        "janCode": "4902370552683",
-        "results": 1,
+        "jan_code": "4902370552683",
     }).json()
     log.info(json.dumps(result, ensure_ascii=False, indent=2))
     return  # 1件確認したら止める
