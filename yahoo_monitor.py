@@ -120,7 +120,7 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
             shipping = item.get("shipping", {})
 
             # FIX ③: code==2 は非公式判定 → name のみで判定
-           if shipping.get("code") == 2 or shipping.get("name") == "送料無料":
+            if shipping.get("code") == 2 or shipping.get("name") == "送料無料":
                 shipping_cost = 0
             else:
                 # FIX ②: lowestPrice → minPrice（正しいフィールド名）
