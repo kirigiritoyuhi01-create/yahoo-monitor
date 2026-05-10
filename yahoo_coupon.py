@@ -1,8 +1,8 @@
 """
 Yahoo Shopping Coupon Bot - Playwright専用版
-- L列（クーポン）のみ更新
+- L列（クーポン）、Q列（クーポン取得時間）、R列（クーポン取得状態）を更新
 - 深夜1回実行
-- 絶対禁止: A,B,C,D,E,F,G,H,I,J,K,M,N,O,P列
+- 絶対禁止: A〜K, M〜P列
 """
 
 import os
@@ -17,21 +17,23 @@ from google.oauth2.service_account import Credentials
 # ───────────────────────────────────────────
 # 設定
 # ───────────────────────────────────────────
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-SHEET_NAME     = os.environ.get("SHEET_NAME", "Sheet1")
-GCP_SA_JSON    = os.environ["GCP_SERVICE_ACCOUNT_JSON"]
+SPREADSHEET_ID  = os.environ["SPREADSHEET_ID"]
+SHEET_NAME      = os.environ.get("SHEET_NAME", "Sheet1")
+GCP_SA_JSON     = os.environ["GCP_SERVICE_ACCOUNT_JSON"]
 
 COUPON_INTERVAL = 2.0  # Playwright実行間隔（秒）
 
 # 列定義（0始まりインデックス）
 COL = {
-    "JAN":     1,   # B 読み取り専用
-    "クーポン": 11,  # L ← このBOTが更新する唯一の列
+    "JAN":              1,   # B 読み取り専用
+    "クーポン":         11,  # L ← 更新対象
+    "クーポン取得時間": 16,  # Q ← 更新対象
+    "クーポン取得状態": 17,  # R ← 更新対象
 }
 
-# このBOTが書き込んでよい列はL=11のみ
-WRITABLE_COLS  = {11}
-FORBIDDEN_COLS = {0,1,2,3,4,5,6,7,8,9,10,12,13,14,15}
+# このBOTが書き込んでよい列
+WRITABLE_COLS  = {11, 16, 17}  # L, Q, R
+FORBIDDEN_COLS = {0,1,2,3,4,5,6,7,8,9,10,12,13,14,15}  # A〜K, M〜P
 
 JST = timezone(timedelta(hours=9))
 
@@ -59,11 +61,20 @@ def get_sheet():
 # ───────────────────────────────────────────
 # 列破壊防止
 # ───────────────────────────────────────────
-def safe_update_coupon(sheet, row: int, value):
-    col_idx = COL["クーポン"]
-    if col_idx in FORBIDDEN_COLS:
-        raise RuntimeError(f"列破壊防止: 列{col_idx+1}への書き込みは禁止")
-    sheet.update_cell(row, col_idx + 1, value)
+def bulk_update_row(sheet, row: int, updates: dict):
+    for col_idx in updates:
+        if col_idx in FORBIDDEN_COLS:
+            raise RuntimeError(
+                f"列破壊防止: 列{col_idx+1}({'ABCDEFGHIJKLMNOPQR'[col_idx]})への書き込みは禁止"
+            )
+        if col_idx not in WRITABLE_COLS:
+            raise RuntimeError(f"予期しない列: 列{col_idx+1}")
+
+    cell_list = [
+        gspread.Cell(row=row, col=col_idx + 1, value=value)
+        for col_idx, value in updates.items()
+    ]
+    sheet.update_cells(cell_list, value_input_option="USER_ENTERED")
 
 
 # ───────────────────────────────────────────
@@ -105,6 +116,13 @@ def get_coupon_playwright(jan_code: str) -> int:
 
 
 # ───────────────────────────────────────────
+# JST現在時刻
+# ───────────────────────────────────────────
+def now_jst() -> str:
+    return datetime.now(JST).strftime("%Y-%m-%d %H:%M")
+
+
+# ───────────────────────────────────────────
 # メイン処理
 # ───────────────────────────────────────────
 def run():
@@ -128,17 +146,28 @@ def run():
         log.info(f"[行{sheet_row}] クーポン取得: JAN={jan_code}")
 
         coupon_val = get_coupon_playwright(jan_code)
+        timestamp  = now_jst()
 
         if coupon_val == -1:
             log.warning(f"[行{sheet_row}] クーポン取得失敗")
+            updates = {
+                COL["クーポン取得時間"]: timestamp,
+                COL["クーポン取得状態"]: "取得失敗",
+            }
             errors += 1
         else:
-            try:
-                safe_update_coupon(sheet, sheet_row, coupon_val)
-                processed += 1
-            except RuntimeError as e:
-                log.error(str(e))
-                continue
+            updates = {
+                COL["クーポン"]:         coupon_val,
+                COL["クーポン取得時間"]: timestamp,
+                COL["クーポン取得状態"]: "成功",
+            }
+            processed += 1
+
+        try:
+            bulk_update_row(sheet, sheet_row, updates)
+        except RuntimeError as e:
+            log.error(str(e))
+            continue
 
         time.sleep(COUPON_INTERVAL)
 
