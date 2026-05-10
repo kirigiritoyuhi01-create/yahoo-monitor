@@ -26,7 +26,7 @@ GCP_SA_JSON    = os.environ["GCP_SERVICE_ACCOUNT_JSON"]
 
 YAHOO_API_URL  = "https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch"
 FETCH_COUNT    = 10   # 送料込み最安値計算のために取得する件数
-API_INTERVAL   = 0.7  # API制限対策（1秒/リクエスト）
+API_INTERVAL   = 0.8  # API制限対策（1秒/リクエスト）
 
 # 列定義（0始まりインデックス）
 COL = {
