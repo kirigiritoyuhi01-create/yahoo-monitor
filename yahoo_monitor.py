@@ -1,7 +1,7 @@
 """
 Yahoo Shopping Monitor Bot - API専用版
 - Yahoo APIで10件取得 → 送料込み最安値選択
-- クーポンはyahoo_coupon.pyで別途取得
+- 429エラー時は待機して再試行（最大3回）
 - 更新対象: G,H,I,J,K,O,P列のみ（L列クーポンは触らない）
 - 絶対禁止: A,B,C,D,E,F,M,N列
 """
@@ -25,26 +25,25 @@ SHEET_NAME     = os.environ.get("SHEET_NAME", "Sheet1")
 GCP_SA_JSON    = os.environ["GCP_SERVICE_ACCOUNT_JSON"]
 
 YAHOO_API_URL  = "https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch"
-FETCH_COUNT    = 10   # 送料込み最安値計算のために取得する件数
-API_INTERVAL   = 1  # API制限対策（1秒/リクエスト）
+FETCH_COUNT    = 10    # 送料込み最安値計算のために取得する件数
+API_INTERVAL   = 1.0  # API制限対策（1秒/リクエスト）
+RETRY_WAITS    = [60, 120, 180]  # 429エラー時の待機時間（秒）
 
 # 列定義（0始まりインデックス）
 COL = {
     "商品名":       0,   # A 読み取り専用
     "JAN":         1,   # B 読み取り専用
-    # C,D,E,F → ルデヤBOT管理・触禁止
-    "URL":         6,   # G ← 更新対象
-    "ショップ名":   7,   # H ← 更新対象
-    "商品価格":     8,   # I ← 更新対象
-    "送料":         9,   # J ← 更新対象
-    "ポイント":    10,   # K ← 更新対象
+    "URL":         6,   # G
+    "ショップ名":   7,   # H
+    "商品価格":     8,   # I
+    "送料":         9,   # J
+    "ポイント":    10,   # K
     # L=11 クーポン → yahoo_coupon.pyが管理
     # M=12, N=13 → スプレッドシート関数・触禁止
-    "最終取得時間": 14,  # O ← 更新対象
-    "取得状態":    15,   # P ← 更新対象
+    "最終取得時間": 14,  # O
+    "取得状態":    15,   # P
 }
 
-# このBOTが書き込んでよい列のみ（クーポンL=11は含まない）
 WRITABLE_COLS  = {6, 7, 8, 9, 10, 14, 15}       # G,H,I,J,K,O,P
 FORBIDDEN_COLS = {0, 1, 2, 3, 4, 5, 11, 12, 13} # A,B,C,D,E,F,L,M,N
 
@@ -72,7 +71,7 @@ def get_sheet():
 
 
 # ───────────────────────────────────────────
-# 列破壊防止（絶対に外さない）
+# 列破壊防止
 # ───────────────────────────────────────────
 def bulk_update_row(sheet, row: int, updates: dict):
     for col_idx in updates:
@@ -96,6 +95,7 @@ def bulk_update_row(sheet, row: int, updates: dict):
 def search_yahoo_best(jan_code: str) -> Optional[dict]:
     """
     JANコードで新品10件取得し、送料込み最安値の1件を返す
+    429エラー時は待機して最大3回リトライ
     返り値: {url, shop_name, price, shipping, point} or None or {"error": "..."}
     """
     params = {
@@ -106,60 +106,76 @@ def search_yahoo_best(jan_code: str) -> Optional[dict]:
         "condition": "new",
         "in_stock":  "true",
     }
-    try:
-        resp = requests.get(YAHOO_API_URL, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
 
-        hits = data.get("hits", [])
-        if not hits:
-            return None
+    for attempt in range(len(RETRY_WAITS) + 1):
+        try:
+            resp = requests.get(YAHOO_API_URL, params=params, timeout=15)
 
-        # 送料込み金額で最安値を選ぶ
-        best_item          = None
-        best_total         = float("inf")
-        best_shipping_cost = 0
+            # 429エラー（Too Many Requests）→ 待機して再試行
+            if resp.status_code == 429:
+                if attempt < len(RETRY_WAITS):
+                    wait = RETRY_WAITS[attempt]
+                    log.warning(f"429エラー: {wait}秒待機して再試行 ({attempt+1}/{len(RETRY_WAITS)}) JAN={jan_code}")
+                    time.sleep(wait)
+                    continue
+                else:
+                    log.error(f"429エラー: 最大リトライ超過 JAN={jan_code}")
+                    return {"error": "API失敗"}
 
-        for item in hits:
-            price    = item.get("price", 0) or 0
-            shipping = item.get("shipping", {})
+            resp.raise_for_status()
+            data = resp.json()
 
-            if shipping.get("code") == 2 or shipping.get("name") == "送料無料":
-                shipping_cost = 0
-            else:
-                shipping_cost = shipping.get("lowestPrice", 0) or 0
+            hits = data.get("hits", [])
+            if not hits:
+                return None
 
-            total = price + shipping_cost
-            if total < best_total:
-                best_total         = total
-                best_item          = item
-                best_shipping_cost = shipping_cost
+            # 送料込み金額で最安値を選ぶ
+            best_item          = None
+            best_total         = float("inf")
+            best_shipping_cost = 0
 
-        if best_item is None:
-            return None
+            for item in hits:
+                price    = item.get("price", 0) or 0
+                shipping = item.get("shipping", {})
 
-        # ポイント（LYPポイント優先）
-        point_data = best_item.get("point", {})
-        point = (
-            point_data.get("lyLimitedBonusAmount") or
-            point_data.get("amount") or
-            0
-        )
+                if shipping.get("code") == 2 or shipping.get("name") == "送料無料":
+                    shipping_cost = 0
+                else:
+                    shipping_cost = shipping.get("lowestPrice", 0) or 0
 
-        return {
-            "url":       best_item.get("url", ""),
-            "shop_name": best_item.get("seller", {}).get("name", ""),
-            "price":     best_item.get("price", 0),
-            "shipping":  best_shipping_cost,
-            "point":     point,
-        }
+                total = price + shipping_cost
+                if total < best_total:
+                    best_total         = total
+                    best_item          = item
+                    best_shipping_cost = shipping_cost
 
-    except requests.exceptions.Timeout:
-        log.warning(f"Yahoo API タイムアウト: {jan_code}")
-        return {"error": "API失敗"}
-    except Exception as e:
-        log.error(f"Yahoo API エラー: {e}")
-        return {"error": "API失敗"}
+            if best_item is None:
+                return None
+
+            # ポイント（LYPポイント優先）
+            point_data = best_item.get("point", {})
+            point = (
+                point_data.get("lyLimitedBonusAmount") or
+                point_data.get("amount") or
+                0
+            )
+
+            return {
+                "url":       best_item.get("url", ""),
+                "shop_name": best_item.get("seller", {}).get("name", ""),
+                "price":     best_item.get("price", 0),
+                "shipping":  best_shipping_cost,
+                "point":     point,
+            }
+
+        except requests.exceptions.Timeout:
+            log.warning(f"Yahoo API タイムアウト: {jan_code}")
+            return {"error": "API失敗"}
+        except Exception as e:
+            log.error(f"Yahoo API エラー: {e}")
+            return {"error": "API失敗"}
+
+    return {"error": "API失敗"}
 
 
 # ───────────────────────────────────────────
@@ -173,7 +189,7 @@ def now_jst() -> str:
 # メイン処理
 # ───────────────────────────────────────────
 def run():
-    log.info("=== Yahoo Monitor BOT 開始（APIのみ版）===")
+    log.info("=== Yahoo Monitor BOT 開始（APIのみ版・リトライあり）===")
     sheet = get_sheet()
 
     all_values = sheet.get_all_values()
