@@ -1,7 +1,9 @@
 """
-Yahoo Shopping Monitor Bot - API専用版
+Yahoo Shopping Monitor Bot - API専用・高速一括更新・足切り分離版
 - Yahoo APIで10件取得 → 送料込み最安値選択
 - 429エラー時は待機して再試行（最大3回）
+- 120%以上の高値商品はURLを書き込まずに足切り（yahoo_coupon.pyの負荷激減）
+- 処理終了後にスプレッドシートへ一括バルク書き込み（30分制限を確実に回避）
 - 更新対象: G,H,I,J,K,O,P列のみ（L列クーポンは触らない）
 - 絶対禁止: A,B,C,D,E,F,M,N列
 """
@@ -25,23 +27,24 @@ SHEET_NAME     = os.environ.get("SHEET_NAME", "Sheet1")
 GCP_SA_JSON    = os.environ["GCP_SERVICE_ACCOUNT_JSON"]
 
 YAHOO_API_URL  = "https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch"
-FETCH_COUNT    = 10    # 送料込み最安値計算のために取得する件数
+FETCH_COUNT    = 10   # 送料込み最安値計算のために取得する件数
 API_INTERVAL   = 1.0  # API制限対策（1秒/リクエスト）
 RETRY_WAITS    = [60, 120, 180]  # 429エラー時の待機時間（秒）
 
 # 列定義（0始まりインデックス）
 COL = {
-    "商品名":       0,   # A 読み取り専用
-    "JAN":         1,   # B 読み取り専用
-    "URL":         6,   # G
-    "ショップ名":   7,   # H
-    "商品価格":     8,   # I
-    "送料":         9,   # J
-    "ポイント":    10,   # K
+    "商品名":       0,  # A 読み取り専用
+    "JAN":         1,  # B 読み取り専用
+    "価格基準":     2,  # C 読み取り専用（仕入れ基準価格。120%足切り判定に使用）
+    "URL":         6,  # G
+    "ショップ名":   7,  # H
+    "商品価格":     8,  # I
+    "送料":         9,  # J
+    "ポイント":    10,  # K
     # L=11 クーポン → yahoo_coupon.pyが管理
     # M=12, N=13 → スプレッドシート関数・触禁止
     "最終取得時間": 14,  # O
-    "取得状態":    15,   # P
+    "取得状態":     15,  # P
 }
 
 WRITABLE_COLS  = {6, 7, 8, 9, 10, 14, 15}       # G,H,I,J,K,O,P
@@ -68,25 +71,6 @@ def get_sheet():
     )
     gc = gspread.authorize(creds)
     return gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
-
-
-# ───────────────────────────────────────────
-# 列破壊防止
-# ───────────────────────────────────────────
-def bulk_update_row(sheet, row: int, updates: dict):
-    for col_idx in updates:
-        if col_idx in FORBIDDEN_COLS:
-            raise RuntimeError(
-                f"列破壊防止: 列{col_idx+1}({'ABCDEFGHIJKLMNOP'[col_idx]})への書き込みは禁止"
-            )
-        if col_idx not in WRITABLE_COLS:
-            raise RuntimeError(f"予期しない列: 列{col_idx+1}")
-
-    cell_list = [
-        gspread.Cell(row=row, col=col_idx + 1, value=value)
-        for col_idx, value in updates.items()
-    ]
-    sheet.update_cells(cell_list, value_input_option="USER_ENTERED")
 
 
 # ───────────────────────────────────────────
@@ -189,12 +173,16 @@ def now_jst() -> str:
 # メイン処理
 # ───────────────────────────────────────────
 def run():
-    log.info("=== Yahoo Monitor BOT 開始（APIのみ版・リトライあり）===")
+    log.info("=== Yahoo Monitor BOT 開始（分離・一括高速版） ===")
     sheet = get_sheet()
 
     all_values = sheet.get_all_values()
     processed  = 0
     errors     = 0
+    cutoff_count = 0
+
+    # 一括アップデート用のセルリスト
+    cell_list = []
 
     for i, row_data in enumerate(all_values):
         sheet_row = i + 1
@@ -204,6 +192,15 @@ def run():
         jan_code     = row_data[COL["JAN"]].strip()    if len(row_data) > COL["JAN"]    else ""
         product_name = row_data[COL["商品名"]].strip() if len(row_data) > COL["商品名"] else ""
 
+        # C列の基準価格を取得（数値に変換、カンマ等を除去）
+        base_price_str = row_data[COL["価格基準"]].strip() if len(row_data) > COL["価格基準"] else ""
+        base_price = 0
+        if base_price_str:
+            try:
+                base_price = int(base_price_str.replace(",", "").replace("円", ""))
+            except ValueError:
+                base_price = 0
+
         if not jan_code and not product_name:
             continue  # 空行スキップ
 
@@ -211,10 +208,12 @@ def run():
             log.warning(f"[行{sheet_row}] JANコードなし・スキップ: {product_name}")
             continue
 
-        log.info(f"[行{sheet_row}] JAN={jan_code}")
+        log.info(f"[行{sheet_row}] JAN={jan_code} (基準価格: {base_price}円)")
 
         result    = search_yahoo_best(jan_code)
         timestamp = now_jst()
+
+        updates = {}
 
         if result is None:
             updates = {
@@ -233,26 +232,56 @@ def run():
             }
             errors += 1
         else:
-            updates = {
-                COL["URL"]:         result["url"],
-                COL["ショップ名"]:   result["shop_name"],
-                COL["商品価格"]:     result["price"],
-                COL["送料"]:         result["shipping"],
-                COL["ポイント"]:     result["point"],
-                COL["最終取得時間"]: timestamp,
-                COL["取得状態"]:     "成功",
-            }
-            processed += 1
+            # ───────────────────────────────────────────
+            # 【新機能】120%足切り判定ロジック
+            # ───────────────────────────────────────────
+            total_cost = result["price"] + result["shipping"]
+            
+            # C列に基準価格が入っており、かつ送料込み最安値がその120%を超えている場合
+            if base_price > 0 and total_cost > (base_price * 1.2):
+                log.info(f" -> ❌ 足切り判定: 送料込み最安値({total_cost}円)が基準価格({base_price}円)の120%を超過。URLを空にします。")
+                updates = {
+                    COL["URL"]:         "",  # URLを空にしてyahoo_coupon.pyの巡回対象から外す
+                    COL["ショップ名"]:   result["shop_name"],
+                    COL["商品価格"]:     result["price"],
+                    COL["送料"]:         result["shipping"],
+                    COL["ポイント"]:     result["point"],
+                    COL["最終取得時間"]: timestamp,
+                    COL["取得状態"]:     "足切り(高値)",
+                }
+                cutoff_count += 1
+            else:
+                # 120%以下なら合格！正常にURLを書き込んでPlaywrightにパスする
+                updates = {
+                    COL["URL"]:         result["url"],
+                    COL["ショップ名"]:   result["shop_name"],
+                    COL["商品価格"]:     result["price"],
+                    COL["送料"]:         result["shipping"],
+                    COL["ポイント"]:     result["point"],
+                    COL["最終取得時間"]: timestamp,
+                    COL["取得状態"]:     "成功",
+                }
+                processed += 1
 
-        try:
-            bulk_update_row(sheet, sheet_row, updates)
-        except RuntimeError as e:
-            log.error(str(e))
-            continue
+        # 列破壊防止の検証＆一括保存用リストへの追加
+        for col_idx, value in updates.items():
+            if col_idx in FORBIDDEN_COLS:
+                raise RuntimeError(f"列破壊防止: 列{col_idx+1}への書き込みは禁止されています")
+            
+            # gspread用のCellオブジェクトを作成してプールする
+            cell_list.append(gspread.Cell(row=sheet_row, col=col_idx + 1, value=value))
 
         time.sleep(API_INTERVAL)
 
-    log.info(f"=== 完了: 成功={processed}, エラー={errors} ===")
+    # ───────────────────────────────────────────
+    # 【新機能】最後に一括（バルク）でスプレッドシートへ書き込み
+    # ───────────────────────────────────────────
+    if cell_list:
+        log.info(f"--- スプレッドシートに一括保存中... (合計 {len(cell_list)} セル) ---")
+        sheet.update_cells(cell_list, value_input_option="USER_ENTERED")
+        log.info("--- スプレッドシートの一括保存が完了しました！ ---")
+
+    log.info(f"=== 完了: 正常合格={processed}, 高値足切り={cutoff_count}, エラー={errors} ===")
 
 
 if __name__ == "__main__":
