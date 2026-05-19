@@ -1,7 +1,9 @@
 """
-Yahoo Shopping Coupon Bot - Playwright専用版
+Yahoo Shopping Coupon Bot - Playwright専用・高速一括・足切り連携版
+- G列のURLが空（yahoo_monitor.pyで足切りされた高値商品）の場合はPlaywrightを起動せずスキップ！
+- ブラウザを1回だけ起動して使い回すことで、処理速度を劇的に向上
+- 処理終了後にスプレッドシートへ一括バルク書き込み（制限回避）
 - L列（クーポン）、Q列（クーポン取得時間）、R列（クーポン取得状態）を更新
-- 深夜1回実行
 - 絶対禁止: A〜K, M〜P列
 """
 
@@ -21,11 +23,12 @@ SPREADSHEET_ID  = os.environ["SPREADSHEET_ID"]
 SHEET_NAME      = os.environ.get("SHEET_NAME", "Sheet1")
 GCP_SA_JSON     = os.environ["GCP_SERVICE_ACCOUNT_JSON"]
 
-COUPON_INTERVAL = 2.0  # Playwright実行間隔（秒）
+COUPON_INTERVAL = 1.0  # ブラウザ使い回しにより、間隔を少し短縮可能
 
 # 列定義（0始まりインデックス）
 COL = {
-    "JAN":              1,   # B 読み取り専用
+    "JAN":              1,  # B 読み取り専用
+    "URL":              6,  # G 読み取り専用（足切り判定に使用）
     "クーポン":         11,  # L ← 更新対象
     "クーポン取得時間": 16,  # Q ← 更新対象
     "クーポン取得状態": 17,  # R ← 更新対象
@@ -59,31 +62,11 @@ def get_sheet():
 
 
 # ───────────────────────────────────────────
-# 列破壊防止
+# Playwright クーポン取得（ブラウザ/ページ使い回し版）
 # ───────────────────────────────────────────
-def bulk_update_row(sheet, row: int, updates: dict):
-    for col_idx in updates:
-        if col_idx in FORBIDDEN_COLS:
-            raise RuntimeError(
-                f"列破壊防止: 列{col_idx+1}({'ABCDEFGHIJKLMNOPQR'[col_idx]})への書き込みは禁止"
-            )
-        if col_idx not in WRITABLE_COLS:
-            raise RuntimeError(f"予期しない列: 列{col_idx+1}")
-
-    cell_list = [
-        gspread.Cell(row=row, col=col_idx + 1, value=value)
-        for col_idx, value in updates.items()
-    ]
-    sheet.update_cells(cell_list, value_input_option="USER_ENTERED")
-
-
-# ───────────────────────────────────────────
-# Playwright クーポン取得
-# ───────────────────────────────────────────
-def get_coupon_playwright(jan_code: str) -> int:
+def get_coupon_playwright(page, jan_code: str) -> int:
     """
-    一覧ページ（価格+送料安い順・新品）から
-    1件目のクーポンバッジを取得
+    立ち上がっているpageオブジェクトを使って、クーポンを取得。
     返り値: クーポン額（円）/ 0=なし / -1=取得失敗
     """
     url = (
@@ -91,24 +74,19 @@ def get_coupon_playwright(jan_code: str) -> int:
         f"?tab_ex=commerce&used=2&prom=1&X=12"
     )
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            page.wait_for_timeout(2000)
+        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        page.wait_for_timeout(1500)  # 少し待機
 
-            # 確認済みセレクタ
-            selector = '[class*="SearchResultItem__coupon--withLabel"]'
-            elem = page.query_selector(selector)
-            browser.close()
+        # 確認済みセレクタ
+        selector = '[class*="SearchResultItem__coupon--withLabel"]'
+        elem = page.query_selector(selector)
 
-            if not elem:
-                return 0
+        if not elem:
+            return 0
 
-            coupon_text = elem.inner_text()
-            nums = re.findall(r"\d+", coupon_text.replace(",", ""))
-            return int(nums[0]) if nums else 0
+        coupon_text = elem.inner_text()
+        nums = re.findall(r"\d+", coupon_text.replace(",", ""))
+        return int(nums[0]) if nums else 0
 
     except Exception as e:
         log.warning(f"Playwright クーポン取得失敗 ({jan_code}): {e}")
@@ -126,52 +104,93 @@ def now_jst() -> str:
 # メイン処理
 # ───────────────────────────────────────────
 def run():
-    log.info("=== Yahoo Coupon BOT 開始（深夜1回版）===")
+    log.info("=== Yahoo Coupon BOT 開始（分離連携・高速一括版） ===")
     sheet = get_sheet()
 
     all_values = sheet.get_all_values()
     processed  = 0
     errors     = 0
+    skipped    = 0
 
-    for i, row_data in enumerate(all_values):
-        sheet_row = i + 1
-        if sheet_row == 1:
-            continue  # ヘッダースキップ
+    # 一括アップデート用のセルリスト
+    cell_list = []
 
-        jan_code = row_data[COL["JAN"]].strip() if len(row_data) > COL["JAN"] else ""
+    # Playwrightをここで1回だけ起動する（使い回し構造）
+    from playwright.sync_api import sync_playwright
+    
+    with sync_playwright() as p:
+        # スキップ判定があるため、本当に必要な行がある場合だけブラウザを開く準備
+        browser = None
+        page = None
 
-        if not jan_code:
-            continue  # 空行スキップ
+        for i, row_data in enumerate(all_values):
+            sheet_row = i + 1
+            if sheet_row == 1:
+                continue  # ヘッダースキップ
 
-        log.info(f"[行{sheet_row}] クーポン取得: JAN={jan_code}")
+            jan_code = row_data[COL["JAN"]].strip() if len(row_data) > COL["JAN"] else ""
+            url_val  = row_data[COL["URL"]].strip() if len(row_data) > COL["URL"] else ""
 
-        coupon_val = get_coupon_playwright(jan_code)
-        timestamp  = now_jst()
+            if not jan_code:
+                continue  # 空行スキップ
 
-        if coupon_val == -1:
-            log.warning(f"[行{sheet_row}] クーポン取得失敗")
-            updates = {
-                COL["クーポン取得時間"]: timestamp,
-                COL["クーポン取得状態"]: "取得失敗",
-            }
-            errors += 1
-        else:
-            updates = {
-                COL["クーポン"]:         coupon_val,
-                COL["クーポン取得時間"]: timestamp,
-                COL["クーポン取得状態"]: "成功",
-            }
-            processed += 1
+            # ───────────────────────────────────────────
+            # 【新機能】足切り連携スキップロジック
+            # ───────────────────────────────────────────
+            # URLが書き込まれていない＝yahoo_monitor側で利益なしと判断された商品は無視！
+            if not url_val:
+                log.info(f"[行{sheet_row}] ⏩ 足切り商品のためクーポン取得をスキップ (JAN={jan_code})")
+                skipped += 1
+                continue
 
-        try:
-            bulk_update_row(sheet, sheet_row, updates)
-        except RuntimeError as e:
-            log.error(str(e))
-            continue
+            log.info(f"[行{sheet_row}] 🔍 クーポン精査を開始: JAN={jan_code}")
 
-        time.sleep(COUPON_INTERVAL)
+            # スキップをすり抜けた本命の商品が来たら、初めてブラウザを起動する（無駄な起動を防止）
+            if browser is None:
+                log.info("-> 🚀 Playwright ブラウザを起動します...")
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
 
-    log.info(f"=== 完了: 成功={processed}, エラー={errors} ===")
+            coupon_val = get_coupon_playwright(page, jan_code)
+            timestamp  = now_jst()
+
+            if coupon_val == -1:
+                log.warning(f"[行{sheet_row}] クーポン取得エラー")
+                updates = {
+                    COL["クーポン取得時間"]: timestamp,
+                    COL["クーポン取得状態"]: "取得失敗",
+                }
+                errors += 1
+            else:
+                updates = {
+                    COL["クーポン"]:         coupon_val,
+                    COL["クーポン取得時間"]: timestamp,
+                    COL["クーポン取得状態"]: "成功",
+                }
+                processed += 1
+
+            # 列破壊防止の検証＆一括保存リストへのプール
+            for col_idx, value in updates.items():
+                if col_idx in FORBIDDEN_COLS:
+                    raise RuntimeError(f"列破壊防止: 列{col_idx+1}への書き込みは禁止されています")
+                cell_list.append(gspread.Cell(row=sheet_row, col=col_idx + 1, value=value))
+
+            time.sleep(COUPON_INTERVAL)
+
+        # すべて終わったらブラウザを閉じる
+        if browser:
+            log.info("-> 🛑 Playwright ブラウザを終了します。")
+            browser.close()
+
+    # ───────────────────────────────────────────
+    # 【新機能】最後に一括（バルク）でスプレッドシートへ書き込み
+    # ───────────────────────────────────────────
+    if cell_list:
+        log.info(f"--- スプレッドシートに一括保存中... (合計 {len(cell_list)} セル) ---")
+        sheet.update_cells(cell_list, value_input_option="USER_ENTERED")
+        log.info("--- スプレッドシートの一括保存が完了しました！ ---")
+
+    log.info(f"=== 完了: クーポン精査成功={processed}, スキップ={skipped}, エラー={errors} ===")
 
 
 if __name__ == "__main__":
