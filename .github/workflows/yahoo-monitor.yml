@@ -1,41 +1,53 @@
-name: yahoo-monitor
+name: Yahoo Monitor Schedule
 
 on:
   schedule:
-    - cron: "0 22 * * *"   # JST 07:00
-    - cron: "0 11 * * *"   # JST 20:00
-    - cron: "1 15 * * *"   # JST 24:01
-  workflow_dispatch:
+    # 💡 日本時間の「水・金・日」の 21:00, 22:00, 23:00, 23:20 に起動（世界標準時 UTC 設定）
+    - cron: '0 12 * * 0,3,5'   # ① 日本時間：水・金・日 21:00（1〜400件目）
+    - cron: '0 13 * * 0,3,5'   # ② 日本時間：水・金・日 22:00（401〜800件目）
+    - cron: '0 14 * * 0,3,5'   # ③ 日本時間：水・金・日 23:00（801〜1100件目）
+    - cron: '20 14 * * 0,3,5'  # 📝 日本時間：水・金・日 23:20（テンプレ用の時間枠）
 
 jobs:
-  yahoo-monitor:
-    name: Yahoo Shopping Monitor
+  run-monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v3
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: requirements_yahoo.txt
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
 
-      - name: Install dependencies
-        run: pip install -r requirements_yahoo.txt
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install gspread google-auth requests
 
-      - name: Install Playwright browsers
-        run: |
-          python -m playwright install chromium
-          sudo apt-get install -y libasound2t64 libatk1.0-0 libcups2 libdrm2 libgbm1 libgtk-3-0 libnspr4 libnss3 libxcomposite1 libxdamage1 libxfixes3 libxkbcommon0 libxrandr2
-
-      - name: Run Yahoo Monitor
-        env:
-          YAHOO_APP_ID:             ${{ secrets.YAHOO_APP_ID }}
-          SPREADSHEET_ID:           ${{ secrets.SPREADSHEET_ID }}
-          SHEET_NAME:               ${{ secrets.SHEET_NAME }}
-          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
-        run: python yahoo_monitor.py
+    # ⏰ 時間を判定して、プログラムに「1」「2」「3」の合図を自動で送る仕組み
+    - name: Run Yahoo Monitor with Group Number
+      env:
+        GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        YAHOO_CLIENT_ID: ${{ secrets.YAHOO_CLIENT_ID }}
+      run: |
+        JST_HOUR=$(date -d "+9 hours" +"%H")
+        JST_MIN=$(date -d "+9 hours" +"%M")
+        
+        if [ "$JST_HOUR" = "21" ]; then
+          echo "▶️ 1回目の実行（1〜400件）を開始します"
+          python yahoo_monitor.py 1
+        elif [ "$JST_HOUR" = "22" ]; then
+          echo "▶️ 2回目の実行（401〜800件）を開始します"
+          python yahoo_monitor.py 2
+        elif [ "$JST_HOUR" = "23" ] && [ "$JST_MIN" -lt "10" ]; then
+          echo "▶️ 3回目の実行（801〜1100件）を開始します"
+          python yahoo_monitor.py 3
+        elif [ "$JST_HOUR" = "23" ] && [ "$JST_MIN" -ge "15" ]; then
+          echo "📝 23:20 になりました。今後ここにテンプレ作成エージェントを連動させます"
+          echo "（現在はまだプログラムがないため、ログ出力のみ行います）"
+        else
+          echo "定期実行の時間外です。安全のため全件モードで実行します。"
+          python yahoo_monitor.py all
+        fi
