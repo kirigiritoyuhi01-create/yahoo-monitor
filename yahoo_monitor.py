@@ -239,7 +239,7 @@ def run():
             
             # C列に基準価格が入っており、かつ送料込み最安値がその120%を超えている場合
             if base_price > 0 and total_cost > (base_price * 1.3):
-                log.info(f" -> ❌ 足切り判定: 送料込み最安値({total_cost}円)が基準価格({base_price}円)の120%を超過。URLを空にします。")
+                log.info(f" -> ❌ 足切り判定: 送料込み最安値({total_cost}円)が基準価格({base_price}円)の130%を超過。URLを空にします。")
                 updates = {
                     COL["URL"]:         "",  # URLを空にしてyahoo_coupon.pyの巡回対象から外す
                     COL["ショップ名"]:   result["shop_name"],
